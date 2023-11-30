@@ -7,9 +7,11 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, ProcessGroup
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.distributed as dist
+from torch.distributed.fsdp.api import ShardingStrategy, MixedPrecision
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from model import GPTConfig, GPT
 
@@ -22,7 +24,7 @@ init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
 dataset = 'wikitext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 256
+block_size = 128
 # model
 n_layer = 12
 n_head = 12
@@ -107,10 +109,17 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 # wrap model with FSDP
-model = FSDP(model, device_id=torch.cuda.current_device())
-print("block size is ", model_args['block_size'])
+group0 = dist.ProcessGroup(int(fsdp_local_rank / 2) + fsdp_local_rank % 2)
+group1 = dist.ProcessGroup(int(fsdp_local_rank / 2) + (fsdp_local_rank + 1) % 2)
+print(f"groups are for device {device}", group0, group1)
+model = FSDP(model, 
+            mixed_precision=MixedPrecision(param_dtype=ptdtype),
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD, 
+            process_group=[group0, group1],
+            device_id=torch.cuda.current_device())
 # optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(beta1, beta2))
+
 
 # ----------------------------FSDP TRAIN------------------------------------
 print(f"Begin FSDP train of local rank {fsdp_local_rank}")
@@ -145,32 +154,56 @@ while True:
         param_group['lr'] = lr
 
     # train
-    for micro_step in range(gradient_accumulation_steps):
-        optimizer.zero_grad()
-        logits, loss = model(X, Y)
-        batch_len = len(X)
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # loss backward
-        loss.backward()
+    if master_process:
+        with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+            with record_function("training profiling"):
+                for micro_step in range(gradient_accumulation_steps):
+                    # optimizer.zero_grad()
+                    logits, loss = model(X, Y)
+                    batch_len = len(X)
+                    # immediately async prefetch next batch while model is doing the forward pass on the GPU
+                    X, Y = get_batch('train')
+                    # loss backward
+                    loss.backward()
+                    optimizer.step()
+                    fsdp_loss[0] += loss.item()
+                    fsdp_loss[1] += batch_len
+                dist.all_reduce(fsdp_loss, op=dist.ReduceOp.SUM)
+                train_accuracy = fsdp_loss[0] / fsdp_loss[1]
+                # flush the gradients as soon as we can, no need for this memory anymore
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+        print("profiler\n", prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
+    else: 
+        for micro_step in range(gradient_accumulation_steps):
+            # optimizer.zero_grad()
+            logits, loss = model(X, Y)
+            batch_len = len(X)
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = get_batch('train')
+            # loss backward
+            loss.backward()
+            optimizer.step()
+            fsdp_loss[0] += loss.item()
+            fsdp_loss[1] += batch_len
+        dist.all_reduce(fsdp_loss, op=dist.ReduceOp.SUM)
+        train_accuracy = fsdp_loss[0] / fsdp_loss[1]
+
+        # flush the gradients as soon as we can, no need for this memory anymore
         optimizer.step()
-        fsdp_loss[0] += loss.item()
-        fsdp_loss[1] += batch_len
-    dist.all_reduce(fsdp_loss, op=dist.ReduceOp.SUM)
-    train_accuracy = fsdp_loss[0] / fsdp_loss[1]
+        optimizer.zero_grad(set_to_none=True)
     
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+    
+
+    
 
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if master_process:
-        print(f"iter {iter_num}: loss {train_accuracy:.4f}, time {dt*1000:.2f}ms")
+    print(f"device {fsdp_local_rank}, iter {iter_num}: loss {train_accuracy:.4f}, time {dt*1000:.2f}ms, memory usage {torch.cuda.max_memory_allocated(device=device)/1e6:.2f} MB")
     iter_num += 1
-
+    
     # termination conditions
     if iter_num > max_iters:
         break
