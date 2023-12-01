@@ -8,8 +8,8 @@ eval_iters = 50
 
 # logging
 log_interval = 10
-wandb_log = False # feel free to turn on
-wandb_project = 'shakespeare'
+wandb_log = True # feel free to turn on
+wandb_project = 'cs229s-shakespeare'
 wandb_run_name = 'ft-' + str(time.time())
 
 dataset = 'shakespeare'

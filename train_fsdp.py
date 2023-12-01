@@ -34,20 +34,18 @@ if sharding_strategy=="hybrid":
     assert (process_group!=None)
 # I/O
 out_dir = 'out'
-eval_interval = 2 # 2000
-eval_iters = 50 # 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'cs229s'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_name = 'gpt2-medium' # 'run' + str(time.time())
 # data
 dataset = 'wikitext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 128
+batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 1024
 # model
 n_layer = 12
 n_head = 12
@@ -105,6 +103,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # ------------------------------DATA SETUP------------------------------------
 data_dir = os.path.join('data', dataset)
+print("data directory is", data_dir)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
@@ -122,8 +121,7 @@ def get_batch(split):
 # ----------------------------MODEL and OPTIMIZER SETUP------------------------------------
 # model
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, sharding_strategy=sharding_strategy, 
-                  eval_interval=eval_interval, eval_iters =eval_iters) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, sharding_strategy=sharding_strategy) # start with model_args from command line
 override_args = dict(dropout=dropout)
 model = GPT.from_pretrained(init_from, override_args)
 # read off the created config params, so we can store them into checkpoint correctly
@@ -185,6 +183,21 @@ X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 raw_model = model.module # unwrap FSDP container
 model.train()
+if wandb_log and master_process:
+    wandb_config = {
+        "dataset": dataset, 
+        "eval_interval": eval_interval,
+        "eval_iters": eval_iters,
+        "ptdtype": ptdtype,
+        "init_from":init_from, 
+        "batch_size": batch_size
+    }
+    wandb_config.update(model_args) 
+    wandb.init(
+        project=wandb_project,
+        config=wandb_config
+    )
+    print("wandb configs are", wandb_config)
 while True:
     fsdp_loss = torch.zeros(1).to(fsdp_local_rank)
 
@@ -205,7 +218,6 @@ while True:
                     "val/loss": losses['val'],
                     "lr": lr
                 })
-                wandb.log(model_args)
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = losses['val']
                 if iter_num > 0:
@@ -248,6 +260,13 @@ while True:
     t0 = t1
     if master_process:
         print(f"iter {iter_num}: loss {fsdp_loss[0] / fsdp_world_size:.4f}, time {dt*1000:.2f}ms, memory usage {torch.cuda.max_memory_allocated(device=device)/1e6:.2f} MB")
+        if iter_num % eval_interval == 0 and wandb_log:
+            wandb.log({
+                    "train_fsdp_loss": fsdp_loss[0] / fsdp_world_size,
+                    "time (ms)": dt*1000,
+                    "memory (MB)": torch.cuda.max_memory_allocated(device=device)/1e6
+                })
+
     iter_num += 1
     
     # termination conditions

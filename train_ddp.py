@@ -48,8 +48,8 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'wikitext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes # DEBUG
-batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 128
+batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 1024
 # model
 n_layer = 12
 n_head = 12
