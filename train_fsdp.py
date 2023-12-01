@@ -120,6 +120,8 @@ model = FSDP(model,
             device_id=torch.cuda.current_device())
 # optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(beta1, beta2))
+# scaler 
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # ----------------------------FSDP TRAIN------------------------------------
 print(f"Begin FSDP train of local rank {fsdp_local_rank}")
@@ -161,12 +163,16 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # loss backward
-        loss.backward()
+        scaler.scale(loss).backward()
         fsdp_loss[0] += loss.item() / gradient_accumulation_steps
     dist.all_reduce(fsdp_loss, op=dist.ReduceOp.SUM)
 
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.step()
+    # clip the gradient
+    if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
