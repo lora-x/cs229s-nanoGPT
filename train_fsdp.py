@@ -2,6 +2,7 @@ import os
 import time
 import math
 import pickle
+import wandb
 from contextlib import nullcontext
 
 import numpy as np
@@ -19,9 +20,29 @@ from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
+# FSDP parameters
+sharding_strategy = "full" # "hybrid", "grad_op", "no"
+sharding_map = {
+    "full": ShardingStrategy.FULL_SHARD,
+    "hybrid": ShardingStrategy.HYBRID_SHARD,
+    "grad_op": ShardingStrategy.SHARD_GRAD_OP,
+    "no": ShardingStrategy.NO_SHARD
+}
+print(f"we are using {sharding_map[sharding_strategy]}")
+process_group = None
+if sharding_strategy=="hybrid": 
+    assert (process_group!=None)
 # I/O
 out_dir = 'out'
+eval_interval = 2 # 2000
+eval_iters = 50 # 200
+eval_only = False # if True, script exits right after the first eval
+always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
+# wandb logging
+wandb_log = True # disabled by default
+wandb_project = 'cs229s'
+wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'wikitext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -101,7 +122,8 @@ def get_batch(split):
 # ----------------------------MODEL and OPTIMIZER SETUP------------------------------------
 # model
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, sharding_strategy=sharding_strategy, 
+                  eval_interval=eval_interval, eval_iters =eval_iters) # start with model_args from command line
 override_args = dict(dropout=dropout)
 model = GPT.from_pretrained(init_from, override_args)
 # read off the created config params, so we can store them into checkpoint correctly
@@ -112,10 +134,9 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 # wrap model with FSDP
-
 model = FSDP(model, 
             mixed_precision=MixedPrecision(param_dtype=ptdtype),
-            # sharding_strategy=ShardingStrategy.FULL_SHARD, 
+            sharding_strategy=sharding_map[sharding_strategy], 
             # process_group=(_get_default_group(),_get_default_group()),
             device_id=torch.cuda.current_device())
 # optimizer
@@ -124,7 +145,23 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(beta1
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # ----------------------------FSDP TRAIN------------------------------------
-print(f"Begin FSDP train of local rank {fsdp_local_rank}")
+# helps estimate an arbitrarily accurate loss over either split using many batches
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(1).to(fsdp_local_rank)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            with ctx:
+                logits, loss = model(X, Y)
+            losses[0] += loss.item()
+        dist.all_reduce(losses, op=dist.ReduceOp.SUM)
+        out[split] = losses[0] / (eval_iters * fsdp_world_size) 
+    model.train()
+    return out
+
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -146,6 +183,7 @@ best_val_loss = 1e9
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
+raw_model = model.module # unwrap FSDP container
 model.train()
 while True:
     fsdp_loss = torch.zeros(1).to(fsdp_local_rank)
@@ -155,16 +193,45 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     
+    # evaluate the loss on train/val sets and write checkpoints
+    if iter_num % eval_interval == 0:
+        losses = estimate_loss()
+        if master_process:
+            print(f"step {iter_num}: train loss {losses['train']}, val loss {losses['val']}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr
+                })
+                wandb.log(model_args)
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+    if iter_num == 0 and eval_only:
+        break
+    
     # train
     for micro_step in range(gradient_accumulation_steps):
-        # optimizer.zero_grad()
-        logits, loss = model(X, Y)
-        batch_len = len(X)
+        with ctx:
+            logits, loss = model(X, Y)
+            loss = loss / gradient_accumulation_steps
+            fsdp_loss[0] += loss.item()
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # loss backward
         scaler.scale(loss).backward()
-        fsdp_loss[0] += loss.item() / gradient_accumulation_steps
     dist.all_reduce(fsdp_loss, op=dist.ReduceOp.SUM)
 
     # clip the gradient
