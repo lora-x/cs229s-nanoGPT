@@ -266,7 +266,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    
+    print("SanityNum Max iter ", max_iters)
     # evaluate the loss on train/val sets and write checkpoints
     if master_process:
         print("Sanity Check Before Eval - Percentage of Zeroes in Model: ", model.get_percent_mask_zeroes())

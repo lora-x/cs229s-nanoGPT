@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -114,6 +115,9 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    pruning: bool = False
+    pruning_rate: float = 0.1
+
 
 class GPT(nn.Module):
 
@@ -122,7 +126,8 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-
+        self.prune_masks = None 
+        self.pruning_rate = config.pruning_rate
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -146,6 +151,23 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        if self.config.pruning: 
+            self.prune_masks = {} 
+            for pn, p in self.named_parameters(): 
+              self.prune_masks[pn] = torch.ones_like(p.data, dtype=torch.bool)
+              self.prune_masks[pn].requires_grad_(False) 
+             
+    def get_percent_zeroes(self): 
+        all_weights = torch.cat([p.data.abs().flatten() for p in self.parameters()])
+        num_zeros = (all_weights == 0).sum().item()
+        percentage_zeros = (num_zeros / all_weights.numel()) * 100
+        return percentage_zeros
+
+    def get_percent_mask_zeroes(self): 
+        all_weights = torch.cat([self.prune_masks[pn].data.flatten() for pn in self.prune_masks])
+        num_zeros = (all_weights == 0).sum().item()
+        percentage_zeros = (num_zeros / all_weights.numel()) * 100
+        return percentage_zeros
 
     def get_num_params(self, non_embedding=True):
         """
@@ -167,7 +189,26 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+
+    def update_mask(self, device, verbose=False):
+        if verbose: 
+            print ("Pruning, in update mask")
+        for pn, p in self.named_parameters(): 
+            param_weights = p.data
+            prune_mask_ = self.prune_masks[pn].flatten().squeeze() 
+            param_weights_ = (param_weights.flatten().squeeze().to(device) * prune_mask_.float().to(device).abs()).to(device)
+            num_prune = int(self.pruning_rate * param_weights.numel())
+            mask_values = prune_mask_.float().to(device)
+            param_weights_ = param_weights_ + ((1 - mask_values) * 1e9)
+            _, topk_indices = torch.topk(param_weights_, k=num_prune, largest=False)
+            mask = torch.ones_like(param_weights_, dtype=torch.bool)
+            mask[topk_indices] = 0
+            old_mask = self.prune_masks[pn]
+            self.prune_masks[pn] = old_mask.to(device) * mask.view(param_weights.shape).to(device)
+        if verbose: 
+            print("Percent of zeros in mask: ", str(self.get_percent_mask_zeroes()))
+           
+    def forward(self, idx, targets=None, verbose=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -177,10 +218,11 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        for pn, p in self.named_parameters(): 
+            p.data = p.data.to(device) * self.prune_masks[pn].float().to(device)
+        for idx, block in enumerate(self.transformer.h):
             x = block(x)
         x = self.transformer.ln_f(x)
-
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
@@ -189,7 +231,9 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
+        if verbose: 
+          print("Percent Zeroes in Model: ", self.get_percent_zeroes())
+          print("Percent Zeroes in Mask: ", self.get_percent_mask_zeroes())
         return logits, loss
 
     def crop_block_size(self, block_size):
@@ -208,7 +252,7 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        # assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -223,10 +267,18 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
+        config_args['pruning'] = False # can override this
+        config_args['pruning_rate'] = 0.1
         # we can override the dropout rate, if desired
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
+        if 'pruning' in override_args: 
+            print(f"setting pruning to {override_args['pruning']}")
+            config_args['pruning'] = override_args['pruning']
+        if 'pruning_rate' in override_args: 
+            print(f"setting pruning rate to {override_args['pruning_rate']}")
+            config_args['pruning_rate'] = override_args['pruning_rate']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
