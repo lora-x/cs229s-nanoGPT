@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torch.distributed as dist
-from torch.distributed import rpc, all_gather, ReduceOp, all_reduce
+from torch.distributed import all_reduce, ReduceOp, optim
 from torch.distributed.optim import DistributedOptimizer
 
 class LayerNorm(nn.Module):
@@ -31,7 +31,7 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config, n_part):
+    def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.n_part = dist.get_world_size() # number of partitions/machines
@@ -57,7 +57,7 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2) # (B, T, n_embd) x 3 -> 3 x (B, T, n_embd)
+        q, k, v  = self.c_attn(x).split(self.part_n_embd, dim=2) # (B, T, n_embd) x 3 -> 3 x (B, T, n_embd)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, T, n_embd) -> (B, T, nh, hs) -> (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -103,11 +103,12 @@ class ScatterToParallel(torch.autograd.Function):
     def __init__(self):
         super().__init__()
         
-    def forward(self, x)
+    def forward(self, x):
         return x
     
     def backward(self, grad):
-        return all_gather(grad, ReduceOp.SUM) # TODO: Why not concatenate?
+        all_reduce(grad, ReduceOp.SUM)
+        return grad
      
 # g function in paper        
 class GatherFromParallel(torch.autograd.Function):
@@ -115,66 +116,36 @@ class GatherFromParallel(torch.autograd.Function):
     def __init__(self):
         super().__init__()
         
-    def forward(self, x)
-        return all_reduce(x, ReduceOp.SUM)
+    def forward(self, x):
+        all_reduce(x, ReduceOp.SUM)
+        return x
     
     def backward(self, grad):
         return grad
 
-def _call_method(method, rref, *args, **kwargs):
-    r"""
-    a helper function to call a method on the given RRef
-    """
-    return method(rref.local_value(), *args, **kwargs)
-
-
-def _remote_method(method, rref, *args, **kwargs):
-    r"""
-    a helper function to run method on the owner of rref and fetch back the
-    result using RPC
-    """
-    return rpc.rpc_sync(
-        rref.owner(),
-        _call_method,
-        args=[method, rref] + list(args),
-        kwargs=kwargs
-    )
-
-
-def _parameter_rrefs(module):
-    r"""
-    Create one RRef for each parameter in the given local module, and return a
-    list of RRefs.
-    """
-    param_rrefs = []
-    for name, param in model.named_parameters():
-        param_rrefs.append((name, RRef(param)))
-    return param_rrefs
-
 class Block(nn.Module):
 
-    def __init__(self, config, ps):
+    def __init__(self, config):
         super().__init__()
-        self.n_part = len(ps) # number of partitions/machines
+        self.n_part = dist.get_world_size()
+        self.rank = dist.get_rank()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn_rrefs = [rpc.remote(ps[i], CausalSelfAttention, args=(config)) for i in range(self.n_part)]
+        self.attn = CausalSelfAttention(config).cuda(self.rank) 
         self.attn_dropout = nn.Dropout(config.dropout)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp_rrefs = [rpc.remote(ps[i], MLP, args=(config)) for i in range(self.n_part)]
+        self.mlp = MLP(config).cuda(self.rank)
         self.mlp_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        # x = x + self.attn(self.ln_1(x))
-        # x = x + self.mlp(self.ln_2(x))
         x = self.ln_1(x)
-        x = ScatterToParallel.apply(x)
-        attn_outputs = [_remote_method(CausalSelfAttention.forward, self.attn_rrefs[i], x) for i in range(self.n_part)] # TODO
-        x = GatherFromParallel.apply(attn_outputs)
+        x = ScatterToParallel.apply(x).cuda(self.rank)
+        x = self.attn(x)
+        x = GatherFromParallel.apply(x)
         x = x + self.attn_dropout(x)
         x = self.ln_2(x)
-        x = ScatterToParallel.apply(x)
-        mlp_outputs = [_remote_method(MLP.forward, self.mlp_rrefs[i], x) for i in range(self.n_part)]
-        x = GatherFromParallel.apply(mlp_outputs)
+        x = ScatterToParallel.apply(x).cuda(self.rank)
+        x = self.mlp(x)
+        x = GatherFromParallel.apply(x)
         x = x + self.mlp_dropout(x)
         
         return x
@@ -232,22 +203,6 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
-    
-    def parameter_rrefs(self):
-        remote_params = []
-        """TODO: directly apply to each module (not layer?))
-        which params to add? e.g. position embedding?
-        others local? 
-        """
-        for layer in self.transformer.h:
-            for parallel_block in layer:
-                remote_params.extend(_remote_method(_parameter_rrefs, parallel_block))
-            
-        # get RRefs of each layer
-        remote_params.extend(_remote_method(_parameter_rrefs, self.emb_table_rref))
-        # create RRefs for local parameters
-        remote_params.extend(_parameter_rrefs(self.rnn))
-        return remote_params
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -374,12 +329,6 @@ class GPT(nn.Module):
         extra_args = dict(fused=True) if use_fused else dict()
         
         
-        # setup distributed optimizer
-        optimizer = DistributedOptimizer(
-            optim.SGD,
-            model.parameter_rrefs(),
-            lr=0.05,
-            )
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
