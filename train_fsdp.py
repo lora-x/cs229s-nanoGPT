@@ -36,16 +36,16 @@ if sharding_strategy=="hybrid":
 out_dir = 'out'
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = False # if True, always save a checkpoint after each eval
-init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'cs229s'
-wandb_run_name = 'gpt2-medium' # 'run' + str(time.time())
+wandb_run_name = 'gpt2-small' # 'run' + str(time.time())
 # data
 dataset = 'wikitext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 128
 # model
 n_layer = 12
 n_head = 12
@@ -54,7 +54,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 27 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -271,6 +271,10 @@ while True:
     
     # termination conditions
     if iter_num > max_iters:
+        if master_process: # record the most recent statistics
+            f = open("time_mem_vs_batchsize.txt", "a")
+            f.write(f"\nBatch size {batch_size}: loss {fsdp_loss[0] / fsdp_world_size:.4f}, time {dt*1000:.2f}ms, memory usage {torch.cuda.max_memory_allocated(device=device)/1e6:.2f} MB")
+            f.close()
         break
 
 dist.barrier()

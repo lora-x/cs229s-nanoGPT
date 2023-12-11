@@ -40,16 +40,16 @@ eval_iters = 3 # 200
 log_interval = 1
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'cs229s'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_name = 'gpt2-small' # 'run' + str(time.time())
 # data
 dataset = 'wikitext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes # DEBUG
-batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 128
 # model
 n_layer = 12
 n_head = 12
@@ -144,6 +144,7 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
+print(f"batch size is {batch_size}, block size is {block_size}")
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
