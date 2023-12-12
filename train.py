@@ -55,7 +55,7 @@ n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
+bias = False 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 # max_iters = 600000 # total number of training iterations
@@ -71,8 +71,9 @@ lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
-# pruning = True or False
-pruning = True 
+# set pruning  here 
+masked_pruning = True 
+structured_pruning = False
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
@@ -85,6 +86,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+print("ddp is", ddp)
 if ddp:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
@@ -183,7 +185,7 @@ elif init_from == 'resume':
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout, pruning=pruning)
+    override_args = dict(dropout=dropout, masked_pruning=masked_pruning, structured_pruning=structured_pruning, masked_pruning_rate=0.1, structured_pruning_rate=0.3)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
@@ -257,7 +259,14 @@ running_mfu = -1.0
 prune_interval = 20 
 finished_pruning = False
 target_pruning = 0.9
-num_outside_iters = int(target_pruning / model.pruning_rate)
+num_outside_iters = 0
+if model.masked_pruning:
+    num_outside_iters = int(target_pruning / model.masked_pruning_rate) + 1
+elif model.structured_pruning:
+    # with a self.structured_pruning_rate = 0.3, it takes approx this number of iters to reach the maximum possible sparsity
+    num_outside_iters = 12 
+
+og_num_param = sum(p.numel() for p in model.parameters()) 
 save_pruned_checkpoints = True 
 
 for outside_iter in tqdm(range(num_outside_iters)):
@@ -266,10 +275,11 @@ for outside_iter in tqdm(range(num_outside_iters)):
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    print("SanityNum Max iter ", max_iters)
+    #print("SanityNum Max iter ", max_iters)
     # evaluate the loss on train/val sets and write checkpoints
-    if master_process:
-        print("Sanity Check Before Eval - Percentage of Zeroes in Model: ", model.get_percent_mask_zeroes())
+    runeval = True
+    if runeval and master_process:
+        #print("Sanity Check Before Eval - Percentage of Zeroes in Model: ", model.get_percent_mask_zeroes())
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -296,9 +306,11 @@ for outside_iter in tqdm(range(num_outside_iters)):
               
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if outside_iter == num_outside_iters - 1: 
+            break 
 
     while True:
-        print("Current Inner Iter, ", str(iter_num))
+        # print("Current Inner Iter, ", str(iter_num))
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
         for param_group in optimizer.param_groups:
@@ -308,7 +320,9 @@ for outside_iter in tqdm(range(num_outside_iters)):
             break
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
+        gradient_accumulation_steps =  1
         for micro_step in range(gradient_accumulation_steps):
+            #print("cur micro step: ", micro_step)
             if ddp:
                 # in DDP training we only need to sync gradients at the last micro step.
                 # the official way to do this is with model.no_sync() context manager, but
@@ -321,8 +335,10 @@ for outside_iter in tqdm(range(num_outside_iters)):
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch('train')
             # backward pass, with gradient scaling if training in fp16
+            # print("backward pass in microstep loop")
             scaler.scale(loss).backward()
         # clip the gradient
+        # print ("done with micro step loop")
       
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
@@ -337,6 +353,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1   
+        #print ("about to log")
         if iter_num % log_interval == 0 and master_process:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
@@ -344,13 +361,21 @@ for outside_iter in tqdm(range(num_outside_iters)):
             if local_iter_num >= 5: # let the training loop settle a bit
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, memory usage {torch.cuda.memory_allocated(device=device)/1e6:.2f} MB, mfu {running_mfu*100:.2f}%")
         iter_num += 1
         local_iter_num += 1
         # termination conditions
         if iter_num >= max_iters:
             break
-    model.update_mask(device=device, verbose=True) # prune here
+    if model.structured_pruning:
+        print("Calling structured pruning")
+        model.structured_prune(verbose=False)
+        print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
+        print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
+    elif model.masked_pruning: 
+        print("Calling masked pruning")
+        model.update_mask(device=device, verbose=True) # prune here
+    # model.update_mask(device=device, verbose=True) # prune here
 
 if ddp:
     destroy_process_group()
