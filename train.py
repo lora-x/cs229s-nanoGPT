@@ -280,8 +280,15 @@ for outside_iter in tqdm(range(num_outside_iters)):
     runeval = True
     if runeval and master_process:
         #print("Sanity Check Before Eval - Percentage of Zeroes in Model: ", model.get_percent_mask_zeroes())
+        t_before_eval = time.time()
         losses = estimate_loss()
+        t_after_eval = time.time()
+        eval_time = t_after_eval - t_before_eval
         print(f"step {outside_iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {outside_iter}: Inference time: {eval_time:.4f} seconds")
+        total_tokens_processed = eval_iters * batch_size * block_size
+        tokens_per_second = total_tokens_processed / eval_time
+        print(f"Inference speed: {tokens_per_second:.2f} tokens/second")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -308,15 +315,14 @@ for outside_iter in tqdm(range(num_outside_iters)):
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         if outside_iter == num_outside_iters - 1: 
             break 
-        if outside_iter > 0:
-          if model.structured_pruning:
-            print("Calling structured pruning")
-            model.structured_prune(verbose=False)
-            print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
-            print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
-          elif model.masked_pruning: 
-              print("Calling masked pruning")
-              model.update_mask(device=device, verbose=False) # prune here
+        if model.structured_pruning:
+          print("Calling structured pruning")
+          model.structured_prune(verbose=False)
+          print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
+          print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
+        elif model.masked_pruning: 
+            print("Calling masked pruning")
+            model.update_mask(device=device, verbose=False) # prune here
 
     while True:
         # print("Current Inner Iter, ", str(iter_num))
