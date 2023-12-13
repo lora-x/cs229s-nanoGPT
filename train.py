@@ -284,7 +284,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
         losses = estimate_loss()
         t_after_eval = time.time()
         eval_time = t_after_eval - t_before_eval
-        print(f"step {outside_iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {outside_iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, memory usage {torch.cuda.memory_allocated(device=device)/1e6:.2f} MB")
         print(f"step {outside_iter}: Inference time: {eval_time:.4f} seconds")
         total_tokens_processed = eval_iters * batch_size * block_size
         tokens_per_second = total_tokens_processed / eval_time
