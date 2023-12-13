@@ -40,7 +40,7 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'cs229s'
@@ -72,8 +72,8 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # set pruning  here 
-masked_pruning = True 
-structured_pruning = False
+masked_pruning = False 
+structured_pruning = True
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
@@ -264,7 +264,7 @@ if model.masked_pruning:
     num_outside_iters = int(target_pruning / model.masked_pruning_rate) + 1
 elif model.structured_pruning:
     # with a self.structured_pruning_rate = 0.3, it takes approx this number of iters to reach the maximum possible sparsity
-    num_outside_iters = 12 
+    num_outside_iters = 15 
 
 og_num_param = sum(p.numel() for p in model.parameters()) 
 save_pruned_checkpoints = True 
@@ -281,7 +281,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
     if runeval and master_process:
         #print("Sanity Check Before Eval - Percentage of Zeroes in Model: ", model.get_percent_mask_zeroes())
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {outside_iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -308,6 +308,15 @@ for outside_iter in tqdm(range(num_outside_iters)):
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         if outside_iter == num_outside_iters - 1: 
             break 
+        if outside_iter > 0:
+          if model.structured_pruning:
+            print("Calling structured pruning")
+            model.structured_prune(verbose=False)
+            print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
+            print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
+          elif model.masked_pruning: 
+              print("Calling masked pruning")
+              model.update_mask(device=device, verbose=False) # prune here
 
     while True:
         # print("Current Inner Iter, ", str(iter_num))
@@ -320,7 +329,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
             break
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
-        gradient_accumulation_steps =  1
+        #gradient_accumulation_steps =  5
         for micro_step in range(gradient_accumulation_steps):
             #print("cur micro step: ", micro_step)
             if ddp:
@@ -367,14 +376,14 @@ for outside_iter in tqdm(range(num_outside_iters)):
         # termination conditions
         if iter_num >= max_iters:
             break
-    if model.structured_pruning:
-        print("Calling structured pruning")
-        model.structured_prune(verbose=False)
-        print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
-        print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
-    elif model.masked_pruning: 
-        print("Calling masked pruning")
-        model.update_mask(device=device, verbose=True) # prune here
+    # if model.structured_pruning:
+    #     print("Calling structured pruning")
+    #     model.structured_prune(verbose=False)
+    #     print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
+    #     print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
+    # elif model.masked_pruning: 
+    #     print("Calling masked pruning")
+    #     model.update_mask(device=device, verbose=False) # prune here
     # model.update_mask(device=device, verbose=True) # prune here
 
 if ddp:
