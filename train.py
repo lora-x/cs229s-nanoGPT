@@ -74,6 +74,9 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # set pruning  here 
 masked_pruning = False 
 structured_pruning = True
+structured_pruning_rate = 0.3 # TODO: this changes how much we prune from the MLP when we structured prune 
+masked_pruning_rate = 0.1 
+
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
@@ -185,7 +188,7 @@ elif init_from == 'resume':
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout, masked_pruning=masked_pruning, structured_pruning=structured_pruning, masked_pruning_rate=0.1, structured_pruning_rate=0.3)
+    override_args = dict(dropout=dropout, masked_pruning=masked_pruning, structured_pruning=structured_pruning, masked_pruning_rate=masked_pruning_rate, structured_pruning_rate=structured_pruning_rate)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
@@ -279,7 +282,6 @@ for outside_iter in tqdm(range(num_outside_iters)):
     # evaluate the loss on train/val sets and write checkpoints
     runeval = True
     if runeval and master_process:
-        #print("Sanity Check Before Eval - Percentage of Zeroes in Model: ", model.get_percent_mask_zeroes())
         t_before_eval = time.time()
         losses = estimate_loss()
         t_after_eval = time.time()
@@ -288,7 +290,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
         print(f"step {outside_iter}: Inference time: {eval_time:.4f} seconds")
         total_tokens_processed = eval_iters * batch_size * block_size
         tokens_per_second = total_tokens_processed / eval_time
-        print(f"Inference speed: {tokens_per_second:.2f} tokens/second")
+        print(f"Inference speed (throughput): {tokens_per_second:.2f} tokens/second")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -314,15 +316,17 @@ for outside_iter in tqdm(range(num_outside_iters)):
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         if outside_iter == num_outside_iters - 1: 
+            # if on the last iter, no need to prune again since won't eval the results. 
             break 
-        if model.structured_pruning:
+        if outside_iter > 0 and model.structured_pruning:
           print("Calling structured pruning")
           model.structured_prune(verbose=False)
           print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
           print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
-        elif model.masked_pruning: 
+        elif outside_iter > 0  and model.masked_pruning: 
             print("Calling masked pruning")
             model.update_mask(device=device, verbose=False) # prune here
+            print("Percent of Masks in Model after pruning: ", model.get_percent_mask_zeroes())
 
     while True:
         # print("Current Inner Iter, ", str(iter_num))

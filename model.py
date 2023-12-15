@@ -328,7 +328,7 @@ class GPT(nn.Module):
          for idx, block in enumerate(self.transformer.h):
           if verbose: 
             print(f"Pruning Block Num: {idx}") 
-          block.prune(prune_percent=self.structured_pruning_rate)
+          block.prune(prune_percent=self.structured_pruning_rate) #TODO: this is where we call prune with self.structured_pruning rate!
 
     def update_mask(self, device, verbose=False):
         if verbose: 
