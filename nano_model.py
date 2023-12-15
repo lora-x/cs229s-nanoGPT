@@ -20,7 +20,7 @@ from torch.distributed.optim import DistributedOptimizer
 
 def sprint(text):
     if dist.get_rank() == 0:
-        print("(para) " + text)
+        print("(nano) " + text)
         
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -38,16 +38,15 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.n_part = dist.get_world_size() # number of partitions/machines
-        self.n_head = config.n_head // self.n_part # assume n_head is divisible by n_part
-        self.part_n_embd = config.n_embd // self.n_part
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * self.part_n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(self.part_n_embd, config.n_embd, bias=config.bias) # B split along rows (vertically stacked)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
-        # self.resid_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -58,15 +57,13 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        # 8, 1024, 768
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        head_size = self.part_n_embd // self.n_head # d/h
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.part_n_embd, dim=2) # (B, T, n_embd x 3) -> 3 x (B, T, n_embd)
-        k = k.view(B, T, self.n_head, head_size).transpose(1, 2) # (B, T, n_embd) -> (B, T, nh, hs) -> (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, head_size).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, head_size).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -79,75 +76,42 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        # y: [8, 3, 1024, 64] 64 = 768/(4 * 3) 
-        y = y.transpose(1, 2).contiguous().view(B, T, self.part_n_embd) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
+        # y = self.resid_dropout(self.c_proj(y))
         y = self.c_proj(y)
-        # y = self.resid_dropout(self.c_proj(y)) # dropout moved to Block because not model parallel
+        y = self.resid_dropout(y)
         return y
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.n_part = dist.get_world_size()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd // self.n_part, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd // self.n_part, config.n_embd, bias=config.bias)
-        # self.dropout = nn.Dropout(config.dropout)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
-        # x = self.dropout(x) # moved to block since not parallel
+        x = self.dropout(x)
         return x
-
-# f function in paper
-class ScatterToParallel(torch.autograd.Function):
-    
-    def __init__(self):
-        super().__init__()
-        
-    def forward(self, x):
-        return x
-    
-    def backward(self, grad):
-        all_reduce(grad, ReduceOp.SUM)
-        return grad
-     
-# g function in paper        
-class GatherFromParallel(torch.autograd.Function):
-
-    def __init__(self):
-        super().__init__()
-        
-    def forward(self, x):
-        all_reduce(x, ReduceOp.SUM)
-        return x
-    
-    def backward(self, grad):
-        return grad
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.n_part = dist.get_world_size()
-        self.rank = dist.get_rank()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config).cuda(self.rank) 
-        self.attn_dropout = nn.Dropout(config.dropout)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config).cuda(self.rank)
-        self.mlp_dropout = nn.Dropout(config.dropout)
+        self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn_dropout(GatherFromParallel.apply((self.attn(ScatterToParallel.apply(self.ln_1(x))))))
-        # good so far
-        x = x + self.mlp_dropout(GatherFromParallel.apply(self.mlp(ScatterToParallel.apply(self.ln_2(x)))))
-        
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -167,8 +131,6 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        self.n_part = dist.get_world_size()
-        self.rank = dist.get_rank()
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -250,23 +212,6 @@ class GPT(nn.Module):
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
-    """
-    BREADCRUMB
-    c_attn: d * 3d -split-> 3 of d * d
-    thus need to split, then d -> d/h * h, then take the first k heads, then view back to d * k(d/h), then combine/stack
-    """
-    def _shard_attn_weights(self, w):
-        n_embd = w.size(0)
-        
-
-    def _shard_along_columns(self, x):
-        B, T, C = x.size()
-        assert C % self.n_part == 0
-        x = x.view(B, T, self.n_part, C // self.n_part)
-        x = x.transpose(1, 2).contiguous()
-        x = x.view(B * self.n_part, T, C // self.n_part)
-        return x
-
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
@@ -307,86 +252,20 @@ class GPT(nn.Module):
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        attn = ['attn.c_attn.weight', 'attn.c_proj.weight', 'attn.c_attn.bias', 'attn.c_proj.bias']
-        mlp = ['mlp.c_fc.weight', 'mlp.c_proj.weight', 'mlp.c_fc.bias', 'mlp.c_proj.bias']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        n_part = dist.get_world_size()
-        rank = dist.get_rank()
-        part_n_embd = config.n_embd // n_part
-        heads_per_part = config.n_head // n_part
         for k in sd_keys_hf:
-            
-            # print("\n\nParam: ", k)
-            
-            # first transpose the Conv1D weights
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
-                    sd_hf[k] = sd_hf[k].t()
-            
-            if any(k.endswith(w) for w in attn + mlp):
-                # truncate weight
-                if k.endswith('attn.c_attn.weight'):
-                    # q, k, v  = self.c_attn(x).split(self.part_n_embd, dim=2)
-                    # k = k.view(B, T, self.n_head, C // self.n_head)
-                    # truncate
-                    # start [768, 2304] , goal [576 (= 2304/4), 768], now [3, 768, 0]
-                    sd_hf[k] = sd_hf[k].t() # TODO
-                                        
-                    sd_hf[k] = torch.stack(sd_hf[k].split(config.n_embd, dim=1), dim=0) # d * 3d -> 3 of d * d -> 3 * d * d 
-                    # -> [3, 768, 768]
-                    # sd_hf[k] = torch.stack(sd_hf[k].split(config.n_embd // self.n_part, dim = -1)) # 3 * d * d -> 3 * d * d/n * n
-                    head_size = config.n_embd // config.n_head
-                    sd_hf[k] = sd_hf[k].view(3, config.n_embd, config.n_head, head_size) # -> 3 * d * h * d/h
-                    # -> [3, 768, 12, 64]
-                    sd_hf[k] = sd_hf[k][:, :, rank * heads_per_part : (rank + 1) * heads_per_part, :] # -> 3 * d * h/n_part * d/h
-                    # -> [3, 768, 3, 64]
-                    # restore
-                    sd_hf[k] = sd_hf[k].view(3, config.n_embd, -1) # -> 3 * d * d/n_part
-                    # -> [3, 768, 192]
-                    sd_hf[k] = torch.cat(sd_hf[k].split(1, dim = 0), dim = -1) # -> 3 of d * d/n_part -> d * 3d/n_part
-                    # -> [1, 768, 576]
-                    sd_hf[k] = sd_hf[k].squeeze(0) 
-                    sd_hf[k] = sd_hf[k].t() # TODO
-                elif k.endswith('attn.c_attn.bias'):
-                    # begin with [2304]
-                    sd_hf[k] = torch.stack(sd_hf[k].split(config.n_embd, dim=0)) # 3d -> 3 * d
-                    # -> [3, 768]
-                    sd_hf[k] = sd_hf[k][:, rank * part_n_embd : (rank + 1) * part_n_embd] # 3 * d -> 3 * d/n_part
-                    # sd_hf[k] = sd_hf[k][:, rank * head_size * heads_per_part : (rank + 1) * head_size * heads_per_part] # 3 * d -> 3 * d/n_part
-                    # -> [3, 192]
-                    # restore
-                    sd_hf[k] = torch.cat(sd_hf[k].split(1, dim = 0), dim = -1) # -> d * 3d/n_part
-                    # -> [1, 576]
-                    sd_hf[k] = sd_hf[k].squeeze(0)
-                elif k.endswith('attn.c_proj.weight') or k.endswith('mlp.c_proj.weight'): # split along rows
-                    d_out, d_in = sd_hf[k].size() # [768, 768]
-                    chunk = d_in // n_part
-                    sd_hf[k] = sd_hf[k].t() # d_in * d_out 
-                    sd_hf[k] = sd_hf[k][ rank * chunk : (rank + 1) * chunk, :] # d_out * d_in -> d_out/n_part * d_in
-                    sd_hf[k] = sd_hf[k].t()
-                elif k.endswith('attn.c_proj.bias') or k.endswith('mlp.c_proj.bias'): 
-                    sd_hf[k] = sd_hf[k] / n_part
-                elif k.endswith('mlp.c_fc.weight'): # split along column
-                    d_out, d_in = sd_hf[k].size() # 3072, 768
-                    chunk = d_out // n_part
-                    sd_hf[k] = sd_hf[k].t()
-                    sd_hf[k] = sd_hf[k][ :, rank * chunk : (rank + 1) * chunk]
-                    sd_hf[k] = sd_hf[k].t()
-                elif k.endswith('mlp.c_fc.bias'):
-                    chunk = sd_hf[k].shape[0] // n_part
-                    sd_hf[k] = sd_hf[k][rank * chunk : (rank + 1) * chunk]
-
-
-            # vanilla copy over the other parameters
-            # assert sd_hf[k].shape[::-1] == sd[k].shape # used to have this for the Conv1D weights
-            # print("sd_hf[k].shape: ", sd_hf[k].shape)
-            # print("sd[k].shape: ", sd[k].shape)
-            assert sd_hf[k].shape == sd[k].shape
-            with torch.no_grad():
-                sd[k].copy_(sd_hf[k])
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
 
         return model
 
