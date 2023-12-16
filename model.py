@@ -250,6 +250,46 @@ class GPTConfig:
     structured_pruning_rate: float = 0.3
     structured_pruning: bool = False 
 
+class PruneMask():
+    def __init__(self, params, masked_pruning_rate, device, ddp_world_size=1):
+        self.prune_masks = []
+        self.masked_pruning_rate = masked_pruning_rate
+        for idx, (pn, p) in enumerate(params):  
+            mask_tensor = torch.cat([torch.ones_like(p.data, dtype=torch.bool) for _ in range(ddp_world_size)], dim=0)
+            # mask_tensor = torch.ones_like(p.data, dtype=torch.bool)
+            print(mask_tensor.shape)
+            self.prune_masks.append(mask_tensor.to(device))
+    
+    def get(self):
+        return self.prune_masks
+
+    def update_mask(self, params, device):
+        for idx, (pn, p) in enumerate(params): 
+            param_weights = p.data
+            prune_mask_ = self.prune_masks[idx].flatten().squeeze()
+            param_weights_ = (param_weights.flatten().squeeze() * prune_mask_.float().abs())
+            num_prune = int(self.masked_pruning_rate * param_weights.numel())
+            mask_values = prune_mask_.float()
+            param_weights_ = param_weights_ + ((1 - mask_values) * 1e9)
+            _, topk_indices = torch.topk(param_weights_, k=num_prune, largest=False)
+            mask = torch.ones_like(param_weights_, dtype=torch.bool).to(device)
+            mask[topk_indices] = 0
+            old_mask = self.prune_masks[idx]
+            self.prune_masks[idx] = old_mask * mask.view(param_weights.shape)
+        # print("Percent of zeros in mask: ", str(self.get_percent_mask_zeroes()))
+           
+
+    # def get_percent_zeroes(self):
+    #     all_weights = torch.cat([p.data.abs().flatten() for p in self.parameters()])
+    #     num_zeros = (all_weights == 0).sum().item()
+    #     percentage_zeros = (num_zeros / all_weights.numel()) * 100
+    #     return percentage_zeros
+
+    # def get_percent_mask_zeroes(self): 
+    #     all_weights = torch.cat([self.prune_masks[idx].data.flatten() for idx, pn in enumerate(self.prune_masks)])
+    #     num_zeros = (all_weights == 0).sum().item()
+    #     percentage_zeros = (num_zeros / all_weights.numel()) * 100
+    #     return percentage_zeros
 
 class GPT(nn.Module):
 
@@ -260,9 +300,9 @@ class GPT(nn.Module):
         self.config = config
         self.masked_pruning = config.masked_pruning
         self.structured_pruning = config.structured_pruning # TODO add structured_pruning to override configs 
-        self.prune_masks = None 
-        self.masked_pruning_rate = config.masked_pruning_rate
-        self.structured_pruning_rate = config.structured_pruning_rate
+        # self.prune_masks = None 
+        # self.masked_pruning_rate = config.masked_pruning_rate
+        # self.structured_pruning_rate = config.structured_pruning_rate
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -286,30 +326,6 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-        if self.config.masked_pruning: 
-            self.init_prune_mask_cpu()
-            
-    def init_prune_mask_cpu(self):
-        self.prune_masks = {} 
-        for pn, p in self.named_parameters(): 
-            self.prune_masks[pn] = torch.ones_like(p.data, dtype=torch.bool)
-            self.prune_masks[pn].requires_grad_(False)
-    
-    def prune_mask_to_device(self, device):
-        for pn, p in self.named_parameters(): 
-            self.prune_masks[pn] = self.prune_masks[pn].to(device)
-
-    def get_percent_zeroes(self):
-        all_weights = torch.cat([p.data.abs().flatten() for p in self.parameters()])
-        num_zeros = (all_weights == 0).sum().item()
-        percentage_zeros = (num_zeros / all_weights.numel()) * 100
-        return percentage_zeros
-
-    def get_percent_mask_zeroes(self): 
-        all_weights = torch.cat([self.prune_masks[pn].data.flatten() for pn in self.prune_masks])
-        num_zeros = (all_weights == 0).sum().item()
-        percentage_zeros = (num_zeros / all_weights.numel()) * 100
-        return percentage_zeros
 
     def get_num_params(self, non_embedding=True):
         """
@@ -337,28 +353,8 @@ class GPT(nn.Module):
             print(f"Pruning Block Num: {idx}") 
           block.prune(prune_percent=self.structured_pruning_rate) #TODO: this is where we call prune with self.structured_pruning rate!
 
-    def update_mask(self, device, verbose=False):
-        self.prune_mask_to_device(device)
-        if verbose: 
-            print ("Pruning, in update mask")
-        for pn, p in self.named_parameters(): 
-            param_weights = p.data
-            prune_mask_ = self.prune_masks[pn].flatten().squeeze() 
-            param_weights_ = (param_weights.flatten().squeeze() * prune_mask_.float().abs())
-            num_prune = int(self.masked_pruning_rate * param_weights.numel())
-            mask_values = prune_mask_.float()
-            param_weights_ = param_weights_ + ((1 - mask_values) * 1e9)
-            _, topk_indices = torch.topk(param_weights_, k=num_prune, largest=False)
-            mask = torch.ones_like(param_weights_, dtype=torch.bool).to(device)
-            mask[topk_indices] = 0
-            old_mask = self.prune_masks[pn]
-            self.prune_masks[pn] = old_mask * mask.view(param_weights.shape)
-        if verbose: 
-            print("Percent of zeros in mask: ", str(self.get_percent_mask_zeroes()))
-           
-    def forward(self, idx, targets=None, verbose=False):
+    def forward(self, idx, targets=None, prune_masks=None, verbose=False):
         device = idx.device
-        self.prune_mask_to_device(device)
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
@@ -366,9 +362,9 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb) 
-        if self.prune_masks: 
-            for pn, p in self.named_parameters(): 
-                p.data = p.data * self.prune_masks[pn].float()
+        if prune_masks: 
+            for idx, (pn, p) in enumerate(self.named_parameters()): 
+                p.data = p.data * prune_masks[idx].float()
         for idx, block in enumerate(self.transformer.h):
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -381,8 +377,8 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
         if verbose: 
-          print("Percent Zeroes in Model: ", self.get_percent_zeroes())
-          print("Percent Zeroes in Mask: ", self.get_percent_mask_zeroes())
+            print("Percent Zeroes in Model: ", self.get_percent_zeroes())
+            print("Percent Zeroes in Mask: ", self.get_percent_mask_zeroes())
         return logits, loss
 
     def crop_block_size(self, block_size):
