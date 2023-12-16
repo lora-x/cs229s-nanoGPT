@@ -46,9 +46,9 @@ wandb_log = False # disabled by default
 wandb_project = 'cs229s'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'wikitext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
+dataset = 'shakespeare'
+gradient_accumulation_steps = 8 # used to simulate larger batch sizes
+batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -71,11 +71,11 @@ lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
-# set pruning  here 
-masked_pruning = False 
-structured_pruning = True
-structured_pruning_rate = 0.3 # TODO: this changes how much we prune from the MLP when we structured prune 
+# set pruning hyperparameters here 
+masked_pruning = True 
+structured_pruning = False
 masked_pruning_rate = 0.1 
+structured_pruning_rate = 0.3 # Note: this changes how much we prune from the MLP when we structured prune 
 
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -86,9 +86,8 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
-
 # various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+ddp = False
 print("ddp is", ddp)
 if ddp:
     init_process_group(backend=backend)
@@ -103,6 +102,7 @@ if ddp:
     # down the desired gradient accumulation iterations per process proportionally
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
+    print(f"ddp world size is {ddp_world_size}\n")
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
@@ -278,9 +278,8 @@ for outside_iter in tqdm(range(num_outside_iters)):
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    #print("SanityNum Max iter ", max_iters)
     # evaluate the loss on train/val sets and write checkpoints
-    runeval = True
+    runeval = True # This is more like a run pruning
     if runeval and master_process:
         t_before_eval = time.time()
         losses = estimate_loss()
@@ -325,11 +324,11 @@ for outside_iter in tqdm(range(num_outside_iters)):
           print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
         elif outside_iter > 0  and model.masked_pruning: 
             print("Calling masked pruning")
-            model.update_mask(device=device, verbose=False) # prune here
+            model.module.update_mask(device=device, verbose=False) # prune here
             print("Percent of Masks in Model after pruning: ", model.get_percent_mask_zeroes())
 
     while True:
-        # print("Current Inner Iter, ", str(iter_num))
+        print("Current Inner Iter, ", str(iter_num))
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
         for param_group in optimizer.param_groups:
@@ -341,7 +340,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
         # and using the GradScaler if data type is float16
         #gradient_accumulation_steps =  5
         for micro_step in range(gradient_accumulation_steps):
-            #print("cur micro step: ", micro_step)
+            print("cur micro step: ", micro_step)
             if ddp:
                 # in DDP training we only need to sync gradients at the last micro step.
                 # the official way to do this is with model.no_sync() context manager, but
@@ -357,7 +356,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
             # print("backward pass in microstep loop")
             scaler.scale(loss).backward()
         # clip the gradient
-        # print ("done with micro step loop")
+        print ("done with micro step loop")
       
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
@@ -386,15 +385,6 @@ for outside_iter in tqdm(range(num_outside_iters)):
         # termination conditions
         if iter_num >= max_iters:
             break
-    # if model.structured_pruning:
-    #     print("Calling structured pruning")
-    #     model.structured_prune(verbose=False)
-    #     print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
-    #     print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
-    # elif model.masked_pruning: 
-    #     print("Calling masked pruning")
-    #     model.update_mask(device=device, verbose=False) # prune here
-    # model.update_mask(device=device, verbose=True) # prune here
-
+ 
 if ddp:
     destroy_process_group()
