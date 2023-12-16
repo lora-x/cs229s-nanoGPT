@@ -286,18 +286,19 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-        if self.config.masked_pruning: 
+        if self.masked_pruning: 
             self.init_prune_mask_cpu()
             
     def init_prune_mask_cpu(self):
         self.prune_masks = {} 
+        device = torch.cuda.current_device()
         for pn, p in self.named_parameters(): 
-            self.prune_masks[pn] = torch.ones_like(p.data, dtype=torch.bool)
+            self.prune_masks[pn] = torch.ones_like(p.data, dtype=torch.bool).to(device)
             self.prune_masks[pn].requires_grad_(False)
     
-    def prune_mask_to_device(self, device):
-        for pn, p in self.named_parameters(): 
-            self.prune_masks[pn] = self.prune_masks[pn].to(device)
+    # def prune_mask_to_device(self, device):
+    #     for pn, p in self.named_parameters(): 
+    #         self.prune_masks[pn] = self.prune_masks[pn].to(device)
 
     def get_percent_zeroes(self):
         all_weights = torch.cat([p.data.abs().flatten() for p in self.parameters()])
@@ -338,7 +339,7 @@ class GPT(nn.Module):
           block.prune(prune_percent=self.structured_pruning_rate) #TODO: this is where we call prune with self.structured_pruning rate!
 
     def update_mask(self, device, verbose=False):
-        self.prune_mask_to_device(device)
+        # self.prune_mask_to_device(device)
         if verbose: 
             print ("Pruning, in update mask")
         for pn, p in self.named_parameters(): 
@@ -358,7 +359,7 @@ class GPT(nn.Module):
            
     def forward(self, idx, targets=None, verbose=False):
         device = idx.device
-        self.prune_mask_to_device(device)
+        # self.prune_mask_to_device(device)
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
