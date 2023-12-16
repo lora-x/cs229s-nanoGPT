@@ -3,11 +3,21 @@
 
 ## CS 229s
 
-### Model/Tensor parallelism
+### Model/Tensor parallelism implementation
 
 `python model.py` GPT2 model with tensor parallelism implemented in the fashion of [Megatron LM](https://arxiv.org/abs/1909.08053).
 
 `python sanity_check.py` checks that our tensor parallel model produces almost the same output on a random input as the original nanoGPT as well as Hugging Face's GPT2.
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m torch.distributed.run --standalone --nproc_per_node 4 --nnodes 1 train.py config/train_shakespeare64.py
+
+`CUDA_VISIBLE_DEVICES=<list of available machines> python3 -m torch.distributed.run --standalone --nproc_per_node <num_gpus> --nnodes 1 train.py [config/train_shakespeare.py/config/train_wikitext.py]` supports finetuning a tensor-parallel GPT2 model initialized from a Hugging Face model on the shakespeare or wikitext dataset. It assumes running with torch.distributed, but WORLD_SIZE could be 1 (single GPU).
+
+### Experiment: how throughput and memory use scale with batch size
+
+`run_experiment.sh` finetunes a tensor-parallel model initialized from gpt2-medium for 20 iterations and records the average peak memory use as well as tokens per iteration and the time it takes to run each iteration, from which we can calculate throughput (tokens/second).
+
+`summarize_results.py` plot Memory Usage vs Batch Size and Throughput vs Batch Size.
 
 ### Final project instruction
 
