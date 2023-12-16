@@ -3,8 +3,9 @@ import time
  # This is where the checkpoints will be saved
  # Take note to make sure saved checkpoints don't override each other, depending on what you are trying to accomplish (e.g. for pruning, may want to keep a few checkpoints around)
 out_dir = 'shakespeare'
-eval_interval = 10
-eval_iters = 50
+eval_interval = 10 # original: 10
+eval_iters = 50 # original: 50 TODO
+# eval_iters = 50
 
 # logging
 log_interval = 10
@@ -13,7 +14,8 @@ wandb_project = 'shakespeare'
 wandb_run_name = 'ft-' + str(time.time())
 
 dataset = 'shakespeare'
-init_from = 'gpt2-medium' 
+# init_from = 'gpt2-medium' 
+init_from = 'gpt2'
 
 # only save checkpoints if the validation loss improves
 always_save_checkpoint = False
@@ -22,8 +24,8 @@ always_save_checkpoint = False
 # 1 batch_size * 32 grad_accum * 1024 tokens = 32,768 tokens/iter
 # shakespeare has 301,966 tokens, so 1 epoch ~= 9.2 iters
 batch_size = 8
-gradient_accumulation_steps = 40
-max_iters = 200
+gradient_accumulation_steps = 1 # original: 40
+max_iters = 200 # original: 200 TODO
 
 # finetune at constant LR
 learning_rate = 3e-5

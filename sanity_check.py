@@ -86,7 +86,7 @@ if ddp:
     seed_offset = ddp_rank # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
+    # assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
@@ -109,18 +109,31 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # =================================== END of distributed set up copied from train.py ==========================================
 
 # random input 
-x = torch.tensor([[66, 52, 57],
-                  [27,  2, 51]], device='cuda')
-sprint(f"x = \n {x}")
+# x = torch.tensor([[66, 52, 57],
+#                   [27,  2, 51]], device='cuda')
+# x = torch.load("idx.pt").cuda()
+x = torch.load("X.pt").cuda() # these are a single batch saved from the given dataset
+y = torch.load("Y.pt").cuda()
+sprint(f"x.shape {x.shape}, x = \n {x}")
 
 model = GPT.from_pretrained("gpt2", dict(dropout=0.0)).cuda()
-logits, _ = model(x)
-sprint(f"\n Our model logits:\n {logits}")
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+model.train()
+
+for i in range(1):
+
+    logits, loss = model(x, y) # logit is for last position only if no target (y) provided, else full sequence
+    sprint(f"\n i = {i}: loss {loss}. Our model logits (train) :\n {logits}")
+
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
 
 nano_model = nanoGPT.from_pretrained("gpt2", dict(dropout=0.0)).cuda()
-nano_logits, _ = nano_model(x)
+nano_logits, loss = nano_model(x, y)
 sprint(f"\n Nano model logits:\n {nano_logits}")
 
 hf_model = transformers.GPT2LMHeadModel.from_pretrained("gpt2").cuda()
-hf_logits = hf_model(x).logits[:, -1, :]
-sprint(f"\n Hugging Face model logits:\n {hf_logits}")
+hf_logits = hf_model(x).logits # [:, -1, :]
+sprint(f"\n Hugging Face model logits: {hf_logits}")

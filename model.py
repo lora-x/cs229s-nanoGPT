@@ -18,9 +18,15 @@ import torch.distributed as dist
 from torch.distributed import all_reduce, ReduceOp, optim
 from torch.distributed.optim import DistributedOptimizer
 
+DEBUG = False
+
 def sprint(text):
     if dist.get_rank() == 0:
         print("(para) " + text)
+        
+# def dprint(text):
+#     if DEBUG == True:
+#         sprint(text)
         
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -51,8 +57,9 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = False # TODO debug temporarily disable flash attention
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            sprint("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
@@ -84,6 +91,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.c_proj(y)
+        # dprint(f"after attn.c_proj {y}")
         # y = self.resid_dropout(self.c_proj(y)) # dropout moved to Block because not model parallel
         return y
 
@@ -110,11 +118,16 @@ class ScatterToParallel(torch.autograd.Function):
     def __init__(self):
         super().__init__()
         
-    def forward(self, x):
+    def forward(ctx, x):
+        # print("f forward rank: ", dist.get_rank())
+        # print(f"(rank {dist.get_rank()}) forward in f (scatter): taking in and returning \n {x}")
         return x
     
-    def backward(self, grad):
+    def backward(ctx, grad):
+        # print("f backward rank: ", dist.get_rank())
+        # print(f"(rank {dist.get_rank()}) backward in f (scatter): taking in \n {grad}")
         all_reduce(grad, ReduceOp.SUM)
+        # print(f"(rank {dist.get_rank()}) backward in f (scatter): after all_reduce: {grad}")
         return grad
      
 # g function in paper        
@@ -123,12 +136,24 @@ class GatherFromParallel(torch.autograd.Function):
     def __init__(self):
         super().__init__()
         
-    def forward(self, x):
+    def forward(ctx, x):
+        # print(f"(rank {dist.get_rank()}) forward in g (scatter): taking in \n {x}")
         all_reduce(x, ReduceOp.SUM)
+        # print(f"after all_reduce: {x}")
         return x
     
-    def backward(self, grad):
+    def backward(ctx, grad):
+        # print(f"(rank {dist.get_rank()}) backward in g (gather): taking in and returning \n {grad}")
         return grad
+    
+def print_module_grad_hook(module, grad_input, grad_output):
+    print(f"Gradients on layer {module.__class__.__name__} (rank {dist.get_rank()})")
+    print("Grad input:", grad_input)
+    print("Grad output:", grad_output)
+
+def print_tensor_grad_hook(tensor):
+    # print(f"Gradients on tensor (rank {dist.get_rank()})\n {tensor.grad}")
+    pass
 
 class Block(nn.Module):
 
@@ -144,9 +169,30 @@ class Block(nn.Module):
         self.mlp_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
+        
+        # x.requires_grad_()
+        
+        # y = (self.attn(ScatterToParallel.apply(self.ln_1(x)))) # TODO temp
+        
         x = x + self.attn_dropout(GatherFromParallel.apply((self.attn(ScatterToParallel.apply(self.ln_1(x))))))
-        # good so far
+        
+        # dprint(f"after attn before mlp {x}")
+        
+        # dprint(f"after gather: {GatherFromParallel.apply((self.attn(ScatterToParallel.apply(self.ln_1(x)))))}")
+        
+        # if x.requires_grad:
+        #     dprint(f"x after attn: {x}")
+        #     x.register_hook(print_tensor_grad_hook)
+        
+        # if x.requires_grad:
+        #     dprint(f"x after attn: {x}")
+        #     x.register_hook(print_tensor_grad_hook)
+        
         x = x + self.mlp_dropout(GatherFromParallel.apply(self.mlp(ScatterToParallel.apply(self.ln_2(x)))))
+        
+        # if x.requires_grad:
+        #     dprint(f"x after mlp: {x}")
+        #     x.register_hook(print_tensor_grad_hook)
         
         return x
 
@@ -192,7 +238,7 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        sprint("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -219,13 +265,18 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        
+        # dprint(f"in GPT, idx: {idx}")
+        # torch.save(idx, f"idx_in_forward.pt")
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        x = self.transformer.drop(tok_emb + pos_emb) # OK
+        for i, block in enumerate(self.transformer.h):
+            # dprint(f"Applying hidden layer {i}...")
             x = block(x)
+            # dprint(f"x after block {i}\n: {x}")
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -250,22 +301,22 @@ class GPT(nn.Module):
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
-    """
-    BREADCRUMB
-    c_attn: d * 3d -split-> 3 of d * d
-    thus need to split, then d -> d/h * h, then take the first k heads, then view back to d * k(d/h), then combine/stack
-    """
-    def _shard_attn_weights(self, w):
-        n_embd = w.size(0)
+    # """
+    # BREADCRUMB
+    # c_attn: d * 3d -split-> 3 of d * d
+    # thus need to split, then d -> d/h * h, then take the first k heads, then view back to d * k(d/h), then combine/stack
+    # """
+    # def _shard_attn_weights(self, w):
+    #     n_embd = w.size(0)
         
 
-    def _shard_along_columns(self, x):
-        B, T, C = x.size()
-        assert C % self.n_part == 0
-        x = x.view(B, T, self.n_part, C // self.n_part)
-        x = x.transpose(1, 2).contiguous()
-        x = x.view(B * self.n_part, T, C // self.n_part)
-        return x
+    # def _shard_along_columns(self, x):
+    #     B, T, C = x.size()
+    #     assert C % self.n_part == 0
+    #     x = x.view(B, T, self.n_part, C // self.n_part)
+    #     x = x.transpose(1, 2).contiguous()
+    #     x = x.view(B * self.n_part, T, C // self.n_part)
+    #     return x
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -274,7 +325,7 @@ class GPT(nn.Module):
         # only dropout can be overridden see more notes below
         assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+        sprint("loading weights from pretrained gpt: %s" % model_type)
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
@@ -283,13 +334,13 @@ class GPT(nn.Module):
             'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
         }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        sprint("forcing vocab_size=50257, block_size=1024, bias=True")
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
         # we can override the dropout rate, if desired
         if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
+            sprint(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
@@ -318,8 +369,6 @@ class GPT(nn.Module):
         heads_per_part = config.n_head // n_part
         for k in sd_keys_hf:
             
-            # print("\n\nParam: ", k)
-            
             # first transpose the Conv1D weights
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -329,8 +378,6 @@ class GPT(nn.Module):
             if any(k.endswith(w) for w in attn + mlp):
                 # truncate weight
                 if k.endswith('attn.c_attn.weight'):
-                    # q, k, v  = self.c_attn(x).split(self.part_n_embd, dim=2)
-                    # k = k.view(B, T, self.n_head, C // self.n_head)
                     # truncate
                     # start [768, 2304] , goal [576 (= 2304/4), 768], now [3, 768, 0]
                     sd_hf[k] = sd_hf[k].t() # TODO
@@ -379,11 +426,8 @@ class GPT(nn.Module):
                     chunk = sd_hf[k].shape[0] // n_part
                     sd_hf[k] = sd_hf[k][rank * chunk : (rank + 1) * chunk]
 
-
+            # at this point all parameters should have the same size
             # vanilla copy over the other parameters
-            # assert sd_hf[k].shape[::-1] == sd[k].shape # used to have this for the Conv1D weights
-            # print("sd_hf[k].shape: ", sd_hf[k].shape)
-            # print("sd[k].shape: ", sd[k].shape)
             assert sd_hf[k].shape == sd[k].shape
             with torch.no_grad():
                 sd[k].copy_(sd_hf[k])
@@ -405,14 +449,14 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        sprint(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        sprint(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        sprint(f"using fused AdamW: {use_fused}")
 
         return optimizer
 

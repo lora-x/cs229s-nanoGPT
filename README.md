@@ -3,6 +3,14 @@
 
 ## CS 229s
 
+### Model/Tensor parallelism
+
+`python model.py` GPT2 model with tensor parallelism implemented in the fashion of [Megatron LM](https://arxiv.org/abs/1909.08053).
+
+`python sanity_check.py` checks that our tensor parallel model produces almost the same output on a random input as the original nanoGPT as well as Hugging Face's GPT2.
+
+### Final project instruction
+
 We will be building off of this codebase for the [CS 229s Systems for Machine Learning](https://cs229s.stanford.edu/fall2023/) default final project option. The project training will be on the Wikitext103 language modeling dataset (which will be automatically downloaded from huggingface). You can also use a Shakespeare dataset to help debug (this dataset is tiny!).
 
 This repo includes ```prepare.py``` scripts to prepare the datasets for training:

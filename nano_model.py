@@ -99,6 +99,15 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
+    
+def print_module_grad_hook(module, grad_input, grad_output):
+    print(f"Gradients on layer {module.__class__.__name__} (rank {dist.get_rank()})")
+    print("Grad input:", grad_input)
+    print("Grad output:", grad_output)
+
+def print_tensor_grad_hook(tensor):
+    # print(f"Gradients on tensor (rank {dist.get_rank()})\n {tensor.grad}")
+    pass
 
 class Block(nn.Module):
 
@@ -110,8 +119,19 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
+        x.requires_grad_()
         x = x + self.attn(self.ln_1(x))
+        
+        # if x.requires_grad:
+        #     sprint(f"x after attn: {x}")
+        #     x.register_hook(print_tensor_grad_hook)
+        
         x = x + self.mlp(self.ln_2(x))
+        
+        # if x.requires_grad:
+        #     sprint(f"x after mlp: {x}")
+        #     x.register_hook(print_tensor_grad_hook)
+        
         return x
 
 @dataclass
@@ -181,13 +201,17 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        
+        # sprint(f"idx: {idx}")
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        for i, block in enumerate(self.transformer.h):
+            # sprint(f"Applying hidden layer {i}...")
             x = block(x)
+            # sprint(f"x after block {i}\n: {x}")
         x = self.transformer.ln_f(x)
 
         if targets is not None:
