@@ -47,8 +47,8 @@ wandb_project = 'cs229s'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'shakespeare'
-gradient_accumulation_steps = 8 # used to simulate larger batch sizes
-batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 40 # used to simulate larger batch sizes
+batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -263,9 +263,9 @@ prune_interval = 20
 finished_pruning = False
 target_pruning = 0.9
 num_outside_iters = 0
-if model.masked_pruning:
-    num_outside_iters = int(target_pruning / model.masked_pruning_rate) + 1
-elif model.structured_pruning:
+if raw_model.masked_pruning:
+    num_outside_iters = int(target_pruning / raw_model.masked_pruning_rate) + 1
+elif raw_model.structured_pruning:
     # with a self.structured_pruning_rate = 0.3, it takes approx this number of iters to reach the maximum possible sparsity
     num_outside_iters = 15 
 
@@ -317,15 +317,15 @@ for outside_iter in tqdm(range(num_outside_iters)):
         if outside_iter == num_outside_iters - 1: 
             # if on the last iter, no need to prune again since won't eval the results. 
             break 
-        if outside_iter > 0 and model.structured_pruning:
+        if outside_iter > 0 and raw_model.structured_pruning:
           print("Calling structured pruning")
-          model.structured_prune(verbose=False)
+          raw_model.structured_prune(verbose=False)
           print(f"Total percent of parameters left after pruning: {sum(p.numel() for p in model.parameters()) / og_num_param}")
           print(f"Total number of parameters left after pruning: {sum(p.numel() for p in model.parameters())}")
-        elif outside_iter > 0  and model.masked_pruning: 
+        elif outside_iter > 0  and raw_model.masked_pruning: 
             print("Calling masked pruning")
-            model.module.update_mask(device=device, verbose=False) # prune here
-            print("Percent of Masks in Model after pruning: ", model.get_percent_mask_zeroes())
+            raw_model.update_mask(device=device, verbose=False) # prune here
+            print("Percent of Masks in Model after pruning: ", raw_model.get_percent_mask_zeroes())
 
     while True:
         print("Current Inner Iter, ", str(iter_num))
@@ -340,7 +340,6 @@ for outside_iter in tqdm(range(num_outside_iters)):
         # and using the GradScaler if data type is float16
         #gradient_accumulation_steps =  5
         for micro_step in range(gradient_accumulation_steps):
-            print("cur micro step: ", micro_step)
             if ddp:
                 # in DDP training we only need to sync gradients at the last micro step.
                 # the official way to do this is with model.no_sync() context manager, but
@@ -355,9 +354,7 @@ for outside_iter in tqdm(range(num_outside_iters)):
             # backward pass, with gradient scaling if training in fp16
             # print("backward pass in microstep loop")
             scaler.scale(loss).backward()
-        # clip the gradient
-        print ("done with micro step loop")
-      
+        # clip the gradient      
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)

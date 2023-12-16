@@ -3,8 +3,8 @@ import time
  # This is where the checkpoints will be saved
  # Take note to make sure saved checkpoints don't override each other, depending on what you are trying to accomplish (e.g. for pruning, may want to keep a few checkpoints around)
 out_dir = 'shakespeare'
-eval_interval = 10
-eval_iters = 50
+eval_interval = 2
+eval_iters = 5 # 50
 
 # logging
 log_interval = 1
@@ -21,8 +21,8 @@ always_save_checkpoint = False
 # the number of examples per iter:
 # 1 batch_size * 32 grad_accum * 1024 tokens = 32,768 tokens/iter
 # shakespeare has 301,966 tokens, so 1 epoch ~= 9.2 iters
-batch_size = 2
-gradient_accumulation_steps = 8
+batch_size = 4
+gradient_accumulation_steps = 40
 max_iters = 50
 
 # finetune at constant LR
