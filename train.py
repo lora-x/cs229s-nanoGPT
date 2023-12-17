@@ -7,6 +7,8 @@ import time
 import math
 import random
 import pickle
+import json
+from pprint import pprint
 from contextlib import nullcontext
 
 import numpy as np
@@ -44,7 +46,7 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'cs229s'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
@@ -56,7 +58,7 @@ block_size = 1024
 n_layer = 12
 n_head = 12
 n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+dropout = 0.1 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -79,6 +81,7 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
+key_info = f"{init_from}_{dataset}_batch{batch_size}_eval_iters{eval_iters}_ft_iters{max_iters}"
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -207,10 +210,25 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    sprint(f"Logging to wandb as {wandb_run_name}")
+    
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 running_mfu = -1.0
 best_val_loss = 1e9
+time_per_iter_sum = 0.0
+max_memory_sum = 0.0
+
+results = {
+    "config": config,
+    "tokens_per_iter": tokens_per_iter,
+    "losses": {
+        0: None,
+        10: None,
+        50: None,
+        100: None,
+    }
+}
 
 for iter_num in range(max_iters):
     
@@ -220,32 +238,37 @@ for iter_num in range(max_iters):
         param_group['lr'] = lr
     
     losses = estimate_loss()
-    sprint(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-    if wandb_log:
-        wandb.log({
-            "iter": iter_num,
-            "train/loss": losses['train'],
-            "val/loss": losses['val'],
-            "lr": lr,
-            "mfu": running_mfu*100, # convert to percentage
-        })
+    if master_process:
+        sprint(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": losses['train'],
+                "val/loss": losses['val'],
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+            })
 
-    if losses['val'] < best_val_loss or always_save_checkpoint:
-        best_val_loss = losses['val']
-        if iter_num > 0:
-            checkpoint = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'best_val_loss': best_val_loss,
-                'config': config,
-            }
-            sprint(f"saving checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if losses['val'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val']
+            if iter_num > 0:
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': config,
+                }
+                sprint(f"saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{key_info}.pt'))
     if iter_num == 0 and eval_only:
         break
-    sprint("Starting training")
+    if iter_num in (0, 10, 50, 100):
+        results["losses"][iter_num] = {
+            "train": losses["train"].item(),
+            "val": losses["val"].item(),
+        }
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
             logits, loss = model(X, Y)
@@ -261,6 +284,7 @@ for iter_num in range(max_iters):
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
+    time_per_iter_sum += dt
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
@@ -269,6 +293,21 @@ for iter_num in range(max_iters):
         mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
         running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         sprint(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+    
+    max_memory_sum += torch.cuda.max_memory_allocated(rank)
+    sprint(f"max_memory_sum = {max_memory_sum}")
+
+sprint(f"best_val_loss type {type(best_val_loss)}")
+# save results
+results["best_val_loss"] = best_val_loss.item() if type(best_val_loss) == torch.Tensor else best_val_loss
+results["average_time_per_iter"] = time_per_iter_sum / max_iters
+results["max_memory_per_gpu"] = max_memory_sum / max_iters
+
+with open (os.path.join(out_dir, f'results_{key_info}.json'), 'w') as fout:
+    if master_process:
+        pprint(results)
+    json.dump(results, fout)
+
     
 
 # nano_model = nanoGPT.from_pretrained("gpt2", dict(dropout=dropout)).cuda()

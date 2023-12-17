@@ -15,9 +15,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m torch.distributed.run --standalone --npr
 
 ### Experiment: how throughput and memory use scale with batch size
 
-`run_experiment.sh` finetunes a tensor-parallel model initialized from gpt2-medium for 20 iterations and records the average peak memory use as well as tokens per iteration and the time it takes to run each iteration, from which we can calculate throughput (tokens/second).
+`batch_experiment.sh` finetunes a tensor-parallel model initialized from gpt2-medium for 20 iterations and records the average peak memory use as well as tokens per iteration and the time it takes to run each iteration, from which we can calculate throughput (tokens/second).
 
-`summarize_results.py` plot Memory Usage vs Batch Size and Throughput vs Batch Size.
+`plot_batch_results.py` plot Memory Usage vs Batch Size and Throughput vs Batch Size.
 
 ### Final project instruction
 

@@ -1,7 +1,7 @@
 {
     "config": {
         "DEBUG": false,
-        "master_process": false,
+        "master_process": true,
         "out_dir": "out/shakespeare",
         "eval_interval": 10,
         "log_interval": 10,
@@ -11,10 +11,10 @@
         "init_from": "gpt2-medium",
         "wandb_log": true,
         "wandb_project": "shakespeare",
-        "wandb_run_name": "gpt2-medium_shakespeare_batch1_eval_iters50_ft_iters20-1702834571.8574083",
+        "wandb_run_name": "gpt2-medium_shakespeare_batch2_eval_iters50_ft_iters2-1702834828.955573",
         "dataset": "shakespeare",
         "gradient_accumulation_steps": 40,
-        "batch_size": 1,
+        "batch_size": 2,
         "block_size": 1024,
         "n_layer": 12,
         "n_head": 12,
@@ -22,7 +22,7 @@
         "dropout": 0.1,
         "bias": false,
         "learning_rate": 3e-05,
-        "max_iters": 20,
+        "max_iters": 2,
         "weight_decay": 0.1,
         "beta1": 0.9,
         "beta2": 0.95,
@@ -36,20 +36,17 @@
         "dtype": "bfloat16",
         "compile": false
     },
-    "tokens_per_iter": 40960,
+    "tokens_per_iter": 81920,
     "losses": {
         "0": {
-            "train": 4.166756629943848,
-            "val": 3.9532504081726074
+            "train": 4.113461017608643,
+            "val": 4.028663635253906
         },
-        "10": {
-            "train": 3.850428819656372,
-            "val": 3.573425054550171
-        },
+        "10": null,
         "50": null,
         "100": null
     },
-    "best_val_loss": 1000000000.0,
-    "average_time_per_iter": 10.53592482805252,
-    "max_memory_per_gpu": 3339849907.2
+    "best_val_loss": 3.7851076126098633,
+    "average_time_per_iter": 11.891679763793945,
+    "max_memory_per_gpu": 4850248192.0
 }
