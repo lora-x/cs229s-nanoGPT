@@ -1,7 +1,7 @@
 {
     "config": {
         "DEBUG": false,
-        "master_process": true,
+        "master_process": false,
         "out_dir": "out/wikitext",
         "eval_interval": 10,
         "log_interval": 10,
@@ -11,7 +11,7 @@
         "init_from": "gpt2-medium",
         "wandb_log": false,
         "wandb_project": "wikitext",
-        "wandb_run_name": "gpt2-medium_wikitext_batch4_eval_iters50_ft_iters20-1702710248.4008045",
+        "wandb_run_name": "gpt2-medium_wikitext_batch4_eval_iters50_ft_iters20-1702886513.0979056",
         "dataset": "wikitext",
         "gradient_accumulation_steps": 40,
         "batch_size": 4,
@@ -37,6 +37,19 @@
         "compile": false
     },
     "tokens_per_iter": 163840,
-    "average_time_per_iter": 11.221048963069915,
-    "max_memory_per_gpu": 8567519104.0
+    "losses": {
+        "0": {
+            "train": 4.025301933288574,
+            "val": 4.033468246459961
+        },
+        "10": {
+            "train": 3.9998292922973633,
+            "val": 3.996476650238037
+        },
+        "50": null,
+        "100": null
+    },
+    "best_val_loss": 1000000000.0,
+    "average_time_per_iter": 10.030003213882447,
+    "max_memory_per_gpu": 8566240256.0
 }

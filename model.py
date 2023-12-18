@@ -24,9 +24,9 @@ def sprint(text):
     if dist.get_rank() == 0:
         print("(para) " + text)
         
-# def dprint(text):
-#     if DEBUG == True:
-#         sprint(text)
+def dprint(text):
+    if DEBUG == True:
+        sprint(text)
         
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -91,8 +91,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.c_proj(y)
-        # dprint(f"after attn.c_proj {y}")
-        # y = self.resid_dropout(self.c_proj(y)) # dropout moved to Block because not model parallel
+        # dropout moved to Block because not model parallel, originally: y = self.resid_dropout(self.c_proj(y)) 
         return y
 
 class MLP(nn.Module):
@@ -119,15 +118,10 @@ class ScatterToParallel(torch.autograd.Function):
         super().__init__()
         
     def forward(ctx, x):
-        # print("f forward rank: ", dist.get_rank())
-        # print(f"(rank {dist.get_rank()}) forward in f (scatter): taking in and returning \n {x}")
         return x
     
     def backward(ctx, grad):
-        # print("f backward rank: ", dist.get_rank())
-        # print(f"(rank {dist.get_rank()}) backward in f (scatter): taking in \n {grad}")
         all_reduce(grad, ReduceOp.SUM)
-        # print(f"(rank {dist.get_rank()}) backward in f (scatter): after all_reduce: {grad}")
         return grad
      
 # g function in paper        
@@ -137,23 +131,11 @@ class GatherFromParallel(torch.autograd.Function):
         super().__init__()
         
     def forward(ctx, x):
-        # print(f"(rank {dist.get_rank()}) forward in g (scatter): taking in \n {x}")
         all_reduce(x, ReduceOp.SUM)
-        # print(f"after all_reduce: {x}")
         return x
     
     def backward(ctx, grad):
-        # print(f"(rank {dist.get_rank()}) backward in g (gather): taking in and returning \n {grad}")
         return grad
-    
-def print_module_grad_hook(module, grad_input, grad_output):
-    print(f"Gradients on layer {module.__class__.__name__} (rank {dist.get_rank()})")
-    print("Grad input:", grad_input)
-    print("Grad output:", grad_output)
-
-def print_tensor_grad_hook(tensor):
-    # print(f"Gradients on tensor (rank {dist.get_rank()})\n {tensor.grad}")
-    pass
 
 class Block(nn.Module):
 
@@ -168,32 +150,9 @@ class Block(nn.Module):
         self.mlp = MLP(config).cuda(self.rank)
         self.mlp_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
-        
-        # x.requires_grad_()
-        
-        # y = (self.attn(ScatterToParallel.apply(self.ln_1(x)))) # TODO temp
-        
-        x = x + self.attn_dropout(GatherFromParallel.apply((self.attn(ScatterToParallel.apply(self.ln_1(x))))))
-        
-        # dprint(f"after attn before mlp {x}")
-        
-        # dprint(f"after gather: {GatherFromParallel.apply((self.attn(ScatterToParallel.apply(self.ln_1(x)))))}")
-        
-        # if x.requires_grad:
-        #     dprint(f"x after attn: {x}")
-        #     x.register_hook(print_tensor_grad_hook)
-        
-        # if x.requires_grad:
-        #     dprint(f"x after attn: {x}")
-        #     x.register_hook(print_tensor_grad_hook)
-        
+    def forward(self, x):        
+        x = x + self.attn_dropout(GatherFromParallel.apply((self.attn(ScatterToParallel.apply(self.ln_1(x))))))        
         x = x + self.mlp_dropout(GatherFromParallel.apply(self.mlp(ScatterToParallel.apply(self.ln_2(x)))))
-        
-        # if x.requires_grad:
-        #     dprint(f"x after mlp: {x}")
-        #     x.register_hook(print_tensor_grad_hook)
-        
         return x
 
 @dataclass
@@ -267,7 +226,6 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
         
         # dprint(f"in GPT, idx: {idx}")
-        # torch.save(idx, f"idx_in_forward.pt")
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -300,23 +258,6 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-
-    # """
-    # BREADCRUMB
-    # c_attn: d * 3d -split-> 3 of d * d
-    # thus need to split, then d -> d/h * h, then take the first k heads, then view back to d * k(d/h), then combine/stack
-    # """
-    # def _shard_attn_weights(self, w):
-    #     n_embd = w.size(0)
-        
-
-    # def _shard_along_columns(self, x):
-    #     B, T, C = x.size()
-    #     assert C % self.n_part == 0
-    #     x = x.view(B, T, self.n_part, C // self.n_part)
-    #     x = x.transpose(1, 2).contiguous()
-    #     x = x.view(B * self.n_part, T, C // self.n_part)
-    #     return x
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):

@@ -17,9 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import transformers
 
-from nano_model import GPT as nanoGPT
 from model import GPT
-from utils import get_ix
 
 DEBUG = False
 
@@ -113,31 +111,21 @@ val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r
 batch_position = 0 # make get_batch() deterministic, HACK
 
 def get_ix(max, batch_stride):
-    # sprint(f"max = {max}")
     global batch_position
-    # sprint(f"batch_position = {batch_position}")
-    end_batch_position = batch_position + batch_size * block_size * batch_stride
-    ix = torch.arange(batch_position, end_batch_position, block_size * batch_stride)
+    ix = torch.arange(batch_position, 
+                      batch_position + batch_size * math.floor(block_size * batch_stride), 
+                      math.floor(block_size * batch_stride))
     ix = ix % max # wrap around
-    batch_position = end_batch_position % max # wrap around
-    # sprint(f"end_batch_position = {end_batch_position}")
-    # sprint(f"new batch_position = {batch_position}")
-    # sprint(f"ix: {ix}")
+    batch_position = ix[-1].item() % max # wrap around
+    dprint(f"new batch_position = {batch_position}")
     return ix
     
 def get_batch(split):
     
     data = train_data if split == 'train' else val_data
-    dprint(f"{split} len(data) = {len(data)}")
-    batch_stride = math.ceil((len(data) // (batch_size * block_size)) // 2) # needs to be small enough so that max_ is positive
-    dprint(f"batch_stride = {batch_stride}")
-    # batch_stride = 100 if split == 'train' else 3
-
-    max_ = len(data) - batch_size * block_size * batch_stride
-    dprint(f"max_ = {max_}")
+    batch_stride = len(data) / (batch_size * block_size) / 2 # needs to be small enough so that max_ is strictly positive, can be fraction
+    max_ = len(data) - math.ceil(batch_size * block_size * batch_stride)
     ix = get_ix(max_, batch_stride) # HACK deterministically replace ix = torch.randint(len(data) - block_size, (batch_size,))
-    # ix = torch.tensor([54613,  7668, 33432, 32733, 37811,  8369, 17225, 44417]) # TODO to debug
-    dprint(f"ix: {ix}")
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
@@ -156,8 +144,6 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
 assert init_from.startswith('gpt2')
 sprint(f"Initializing from OpenAI GPT-2 weights: {init_from}")
 model = GPT.from_pretrained("gpt2", dict(dropout=dropout)).cuda()
-nano_model = nanoGPT.from_pretrained("gpt2", dict(dropout=dropout)).cuda()
-# model = nano_model
 # read off the created config params, so we can store them into checkpoint correctly
 for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
     model_args[k] = getattr(model.config, k)
@@ -171,22 +157,17 @@ optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
-    # sprint("In estimate_loss()")
-    # sprint("eval_iters = " + str(eval_iters))
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            # sprint(f"{split} split, iter k = {k}")
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             loss_value = loss.item()
-            # sprint(f"{split} loss_value for one batch = {loss_value}")
             losses[k] = loss_value
         out[split] = losses.mean()
-    # sprint("Finished estimate_loss()")
     model.train()
     return out
 
@@ -294,11 +275,14 @@ for iter_num in range(max_iters):
         running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         sprint(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     
-    max_memory_sum += torch.cuda.max_memory_allocated(rank)
-    sprint(f"max_memory_sum = {max_memory_sum}")
+    memory = torch.cuda.max_memory_allocated(rank)
+    torch.cuda.reset_peak_memory_stats(rank)
+    max_memory_sum += memory
+    sprint(f"memory = {memory}")
 
 sprint(f"best_val_loss type {type(best_val_loss)}")
 # save results
+sprint(f"best val loss: {best_val_loss}")
 results["best_val_loss"] = best_val_loss.item() if type(best_val_loss) == torch.Tensor else best_val_loss
 results["average_time_per_iter"] = time_per_iter_sum / max_iters
 results["max_memory_per_gpu"] = max_memory_sum / max_iters
@@ -307,13 +291,3 @@ with open (os.path.join(out_dir, f'results_{key_info}.json'), 'w') as fout:
     if master_process:
         pprint(results)
     json.dump(results, fout)
-
-    
-
-# nano_model = nanoGPT.from_pretrained("gpt2", dict(dropout=dropout)).cuda()
-# nano_logits, loss = nano_model(x, y)
-# sprint(f"\n Nano model logits:\n {nano_logits}")
-
-# hf_model = transformers.GPT2LMHeadModel.from_pretrained("gpt2").cuda()
-# hf_logits = hf_model(x).logits # [:, -1, :]
-# sprint(f"\n Hugging Face model logits: {hf_logits}")

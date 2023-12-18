@@ -8,15 +8,14 @@ out_dir = 'out/wikitext'
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
 
 dataset = 'wikitext'
-# init_from = 'gpt2'
-init_from = 'gpt2-medium'
+init_from = 'gpt2'
 
 # only save checkpoints if the validation loss improves
 always_save_checkpoint = False
 
 # the number of examples per iter:
 # e.g. 1 batch_size * 32 grad_accum * 1024 tokens = 32,768 tokens/iter
-batch_size = 64
+batch_size = 16
 block_size = 1024
 gradient_accumulation_steps = 5 * 8
 
